@@ -1,14 +1,33 @@
 import copy
 import inspect
 import asyncio
+import contextlib
 import functools
 
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Generator, Optional, Sequence
 import warnings
 
 import pytest
 from _pytest import fixtures
 from _pytest import nodes
+
+
+# The running group's loop, so async fixtures share it with the group's tests.
+# Python 3.14 removed the implicit loop `asyncio.get_event_loop()` used to create.
+_group_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+@contextlib.contextmanager
+def group_event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
+    """A fresh event loop for one concurrent group, closed when the group is done."""
+    global _group_loop
+    loop = asyncio.new_event_loop()
+    _group_loop = loop
+    try:
+        yield loop
+    finally:
+        _group_loop = None
+        loop.close()
 
 
 @pytest.hookimpl(specname="pytest_fixture_setup", tryfirst=True)
@@ -60,13 +79,17 @@ def _wrap_asyncfunc_fixture(fixturedef: pytest.FixtureDef) -> None:
 
     @functools.wraps(fixtureFunc)
     def _async_fixture_wrapper(**kwargs: Dict[str, Any]):
-        event_loop = asyncio.get_event_loop()
-
         async def setup():
             res = await fixtureFunc(**kwargs)
             return res
 
-        return event_loop.run_until_complete(setup())
+        if _group_loop is not None:
+            return _group_loop.run_until_complete(setup())
+        event_loop = asyncio.new_event_loop()
+        try:
+            return event_loop.run_until_complete(setup())
+        finally:
+            event_loop.close()
 
     fixturedef.func = _async_fixture_wrapper  # type: ignore[misc]
 

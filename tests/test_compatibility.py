@@ -4,6 +4,7 @@ import pytest
 
 def test_compatibility_with_pytest_asyncio(pytester: pytest.Pytester):
     """Make sure tests failed is reported correctly"""
+    pytest.importorskip("pytest_asyncio")
 
     pytester.makepyfile(
         dedent(

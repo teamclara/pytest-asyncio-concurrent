@@ -25,6 +25,7 @@ import pytest
 from _pytest import timing
 from _pytest import outcomes
 
+from .fixture_async import group_event_loop
 from .grouping import (
     AsyncioConcurrentGroup,
     AsyncioConcurrentGroupMember,
@@ -81,7 +82,9 @@ MakeItemResult = Union[
 ]
 
 
-@pytest.hookimpl(specname="pytest_pycollect_makeitem", wrapper=True, trylast=True)
+# tryfirst: the outermost wrapper, so it promotes whatever item pytest-asyncio built instead
+# of pytest-asyncio rebuilding (and serially running) the promoted member.
+@pytest.hookimpl(specname="pytest_pycollect_makeitem", wrapper=True, tryfirst=True)
 def pytest_pycollect_makeitem_make_group_and_member(
     collector: pytest.Collector, name: str, obj: object
 ) -> Generator[None, MakeItemResult, MakeItemResult]:
@@ -161,6 +164,21 @@ def pytest_runtestloop_handle_async_by_group(session: pytest.Session) -> Generat
 
     assert sum([len(group.children) for group in groups]) == len(asyncio_concurrent_tests)
 
+    # pytest 9 refuses fixture lookups for nodes missing from SetupState. Members are kept off
+    # that stack on purpose (their group stands in for them), so a member counts as active
+    # while its group is.
+    setupstate = session._setupstate
+    is_node_active = getattr(setupstate, "is_node_active", None)  # added in pytest 9
+
+    if is_node_active is not None:
+
+        def _member_aware_is_node_active(node: Any) -> bool:
+            if isinstance(node, AsyncioConcurrentGroupMember):
+                return is_node_active(node.group)
+            return is_node_active(node)
+
+        setupstate.is_node_active = _member_aware_is_node_active  # type: ignore[method-assign]
+
     result = yield
 
     if session.config.option.collectonly:
@@ -211,35 +229,39 @@ def pytest_runtest_protocol_async_group(
         )
 
     item_passed_setup: List[AsyncioConcurrentGroupMember] = []
-    loop = asyncio.get_event_loop()
+    with group_event_loop() as loop:
+        for childFunc in group.children:
+            childFunc.ihook.pytest_runtest_logstart(
+                nodeid=childFunc.nodeid, location=childFunc.location
+            )
 
-    for childFunc in group.children:
-        childFunc.ihook.pytest_runtest_logstart(
-            nodeid=childFunc.nodeid, location=childFunc.location
-        )
+            report = _call_and_report(_setup_child(childFunc), childFunc, "setup")
+            if report.passed:
+                item_passed_setup.append(childFunc)
 
-        report = _call_and_report(_setup_child(childFunc), childFunc, "setup")
-        if report.passed:
-            item_passed_setup.append(childFunc)
+        coros = [_call_runtest_async(childFunc) for childFunc in item_passed_setup]
+        callinfos = loop.run_until_complete(_gather(coros))
 
-    coros = [_call_runtest_async(childFunc) for childFunc in item_passed_setup]
-    callinfos = loop.run_until_complete(asyncio.gather(*coros))
+        for childFunc, callinfo in zip(item_passed_setup, callinfos):
+            report = childFunc.ihook.pytest_runtest_makereport(item=childFunc, call=callinfo)
+            if _check_interactive_exception(call=callinfo, report=report):
+                childFunc.ihook.pytest_exception_interact(node=childFunc, call=callinfo, report=report)
 
-    for childFunc, callinfo in zip(item_passed_setup, callinfos):
-        report = childFunc.ihook.pytest_runtest_makereport(item=childFunc, call=callinfo)
-        if _check_interactive_exception(call=callinfo, report=report):
-            childFunc.ihook.pytest_exception_interact(node=childFunc, call=callinfo, report=report)
+            childFunc.ihook.pytest_runtest_logreport(report=report)
 
-        childFunc.ihook.pytest_runtest_logreport(report=report)
+        for childFunc in group.children:
+            _call_and_report(_teardown_child(childFunc, nextgroup=nextgroup), childFunc, "teardown")
 
-    for childFunc in group.children:
-        _call_and_report(_teardown_child(childFunc, nextgroup=nextgroup), childFunc, "teardown")
-
-        childFunc.ihook.pytest_runtest_logfinish(
-            nodeid=childFunc.nodeid, location=childFunc.location
-        )
+            childFunc.ihook.pytest_runtest_logfinish(
+                nodeid=childFunc.nodeid, location=childFunc.location
+            )
 
     return True
+
+
+async def _gather(coros: List[Coroutine[Any, Any, pytest.CallInfo]]) -> List[pytest.CallInfo]:
+    # Inside the loop: `asyncio.gather` called outside one needs an implicit loop, gone in 3.14.
+    return list(await asyncio.gather(*coros))
 
 
 async def _call_runtest_async(item: AsyncioConcurrentGroupMember) -> pytest.CallInfo:
