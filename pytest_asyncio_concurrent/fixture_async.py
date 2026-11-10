@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import functools
 
-from typing import Any, Dict, Generator, Optional, Sequence
+from typing import Any, Callable, Dict, Generator, List, Optional, Sequence
 import warnings
 
 import pytest
@@ -28,6 +28,158 @@ def group_event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
     finally:
         _group_loop = None
         loop.close()
+
+
+# True while a concurrent group member's fixtures are being set up.
+_deferring = False
+
+_deferred_key = pytest.StashKey[List["Deferred"]]()
+
+
+@contextlib.contextmanager
+def deferring() -> Generator[None, None, None]:
+    """Function-scoped async fixtures set up in this block return a `Deferred` instead of
+    running, so the member's task can resolve them concurrently with its group."""
+    global _deferring
+    _deferring = True
+    try:
+        yield
+    finally:
+        _deferring = False
+
+
+class Deferred:
+    """A function-scoped async fixture whose setup was postponed to the call phase."""
+
+    def __init__(self, func: Callable[..., Any], kwargs: Dict[str, Any], fixturedef: Any):
+        self.func = func
+        self.kwargs = kwargs
+        self.fixturedef = fixturedef
+        self.is_gen = inspect.isasyncgenfunction(func)
+        self.gen: Any = None
+        self.done = False
+        self.value: Any = None
+        self.exc: Optional[BaseException] = None
+        # Resolved for a sync fixture during setup: torn down by pytest in normal order.
+        self.eager = False
+        self.torn_down = False
+        self.teardown_exc: Optional[BaseException] = None
+
+    async def resolve(self, order: Optional[List["Deferred"]] = None) -> Any:
+        if self.exc is not None:
+            raise self.exc
+        if self.done:
+            return self.value
+        try:
+            kwargs = {
+                k: (await v.resolve(order) if isinstance(v, Deferred) else v)
+                for k, v in self.kwargs.items()
+            }
+            if self.is_gen:
+                self.gen = self.func(**kwargs)
+                self.value = await self.gen.__anext__()
+            else:
+                self.value = await self.func(**kwargs)
+        except BaseException as e:
+            self.exc = e
+            raise
+        self.done = True
+        # Later `request.getfixturevalue` calls see the value, not the placeholder.
+        cached = self.fixturedef.cached_result
+        if cached is not None:
+            self.fixturedef.cached_result = (self.value, *cached[1:])
+        if order is not None:
+            order.append(self)
+        return self.value
+
+    def resolve_eager(self) -> Any:
+        self.eager = True
+        for v in self.kwargs.values():
+            if isinstance(v, Deferred):
+                v.resolve_eager()
+        assert _group_loop is not None
+        return _group_loop.run_until_complete(self.resolve())
+
+    async def teardown(self) -> None:
+        if not self.is_gen or self.gen is None or self.torn_down:
+            return
+        self.torn_down = True
+        try:
+            await self.gen.__anext__()
+        except StopAsyncIteration:
+            return
+        except BaseException as e:
+            self.teardown_exc = e
+            return
+        self.teardown_exc = ValueError("Async generator fixture didn't stop. Yield only once.")
+
+    def finish(self) -> None:
+        """pytest finalizer: tears down what the concurrent pass didn't, reports its error."""
+        if self.is_gen and self.gen is not None and not self.torn_down:
+            assert _group_loop is not None
+            _group_loop.run_until_complete(self.teardown())
+        if self.teardown_exc is not None:
+            raise self.teardown_exc
+
+
+async def resolve_deferred(item: pytest.Function) -> bool:
+    """Resolve the item's deferred fixtures in dependency order; False if it had none."""
+    order: List[Deferred] = []
+    for name in item.fixturenames:
+        value = item.funcargs.get(name)
+        if isinstance(value, Deferred):
+            item.funcargs[name] = await value.resolve(order)
+    item.stash[_deferred_key] = order
+    return bool(order)
+
+
+async def teardown_deferred(item: pytest.Function) -> None:
+    for d in reversed(item.stash.get(_deferred_key, [])):
+        if not d.eager:
+            await d.teardown()
+
+
+def has_deferred(item: pytest.Function) -> bool:
+    return any(isinstance(v, Deferred) for v in item.funcargs.values())
+
+
+@pytest.hookimpl(specname="pytest_fixture_setup", wrapper=True, tryfirst=True)
+def pytest_fixture_setup_defer_async(
+    fixturedef: pytest.FixtureDef, request: pytest.FixtureRequest
+) -> Generator[None, Any, Any]:
+    # tryfirst wrapper: outermost, so pytest-asyncio never sees the async func and runs it.
+    func = fixturedef.func
+    if not _deferring or fixturedef.scope != "function":
+        return (yield)
+
+    if inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func):
+        if inspect.isasyncgenfunction(func):
+
+            def _deferred_gen(**kwargs: Any) -> Any:
+                d = Deferred(func, kwargs, fixturedef)
+                yield d
+                d.finish()
+
+            placeholder: Callable[..., Any] = _deferred_gen
+        else:
+
+            def _deferred_func(**kwargs: Any) -> Any:
+                return Deferred(func, kwargs, fixturedef)
+
+            placeholder = _deferred_func
+
+        fixturedef.func = placeholder  # type: ignore[misc]
+        try:
+            return (yield)
+        finally:
+            fixturedef.func = func  # type: ignore[misc]
+
+    # A sync fixture can't await: resolve the deferred fixtures it depends on now.
+    for argname in fixturedef.argnames:
+        value = request.getfixturevalue(argname)
+        if isinstance(value, Deferred):
+            value.resolve_eager()
+    return (yield)
 
 
 @pytest.hookimpl(specname="pytest_fixture_setup", tryfirst=True)

@@ -5,6 +5,7 @@ import inspect
 import warnings
 import sys
 import contextlib
+import contextvars
 
 from typing import (
     Any,
@@ -16,6 +17,7 @@ from typing import (
     Coroutine,
     Dict,
     Sequence,
+    TypeVar,
     Union,
     cast,
 )
@@ -25,6 +27,7 @@ import pytest
 from _pytest import timing
 from _pytest import outcomes
 
+from . import fixture_async
 from .fixture_async import group_event_loop
 from .grouping import (
     AsyncioConcurrentGroup,
@@ -40,6 +43,7 @@ if sys.version_info < (3, 11):
 # =========================== # Config # =========================== #
 
 asyncio_concurrent_group_key = pytest.StashKey[Dict[str, AsyncioConcurrentGroup]]()
+T = TypeVar("T")
 GroupStrategy = Literal["self", "parent"]
 
 
@@ -229,20 +233,35 @@ def pytest_runtest_protocol_async_group(
         )
 
     item_passed_setup: List[AsyncioConcurrentGroupMember] = []
+    setup_calls: Dict[AsyncioConcurrentGroupMember, pytest.CallInfo] = {}
+    contexts = {child: contextvars.copy_context() for child in group.children}
     with group_event_loop() as loop:
         for childFunc in group.children:
             childFunc.ihook.pytest_runtest_logstart(
                 nodeid=childFunc.nodeid, location=childFunc.location
             )
 
-            report = _call_and_report(_setup_child(childFunc), childFunc, "setup")
-            if report.passed:
+            call = _call(_setup_child(childFunc), childFunc, "setup")
+            if call.excinfo is None and fixture_async.has_deferred(childFunc):
+                # Reported once its deferred fixtures resolve in the concurrent window.
+                setup_calls[childFunc] = call
+                item_passed_setup.append(childFunc)
+            elif _report(call, childFunc).passed:
                 item_passed_setup.append(childFunc)
 
-        coros = [_call_runtest_async(childFunc) for childFunc in item_passed_setup]
-        callinfos = loop.run_until_complete(_gather(coros))
+        coros = [
+            _call_runtest_async(childFunc, setup_calls.get(childFunc))
+            for childFunc in item_passed_setup
+        ]
+        results = loop.run_until_complete(
+            _gather(coros, [contexts[childFunc] for childFunc in item_passed_setup])
+        )
 
-        for childFunc, callinfo in zip(item_passed_setup, callinfos):
+        for childFunc, (setup_call, callinfo) in zip(item_passed_setup, results):
+            if setup_call is not None and not _report(setup_call, childFunc).passed:
+                continue
+            if callinfo is None:
+                continue
             report = childFunc.ihook.pytest_runtest_makereport(item=childFunc, call=callinfo)
             if _check_interactive_exception(call=callinfo, report=report):
                 childFunc.ihook.pytest_exception_interact(
@@ -251,8 +270,20 @@ def pytest_runtest_protocol_async_group(
 
             childFunc.ihook.pytest_runtest_logreport(report=report)
 
+        # Async generator fixture teardowns overlap too; their errors are re-raised by each
+        # fixture's finalizer below, so they report as that test's teardown error.
+        loop.run_until_complete(
+            _gather(
+                [fixture_async.teardown_deferred(child) for child in group.children],
+                [contexts[child] for child in group.children],
+            )
+        )
+
         for childFunc in group.children:
-            _call_and_report(_teardown_child(childFunc, nextgroup=nextgroup), childFunc, "teardown")
+            _report(
+                _call(_teardown_child(childFunc, nextgroup=nextgroup), childFunc, "teardown"),
+                childFunc,
+            )
 
             childFunc.ihook.pytest_runtest_logfinish(
                 nodeid=childFunc.nodeid, location=childFunc.location
@@ -261,17 +292,45 @@ def pytest_runtest_protocol_async_group(
     return True
 
 
-async def _gather(coros: List[Coroutine[Any, Any, pytest.CallInfo]]) -> List[pytest.CallInfo]:
+async def _gather(
+    coros: List[Coroutine[Any, Any, T]], contexts: List[contextvars.Context]
+) -> List[T]:
     # Inside the loop: `asyncio.gather` called outside one needs an implicit loop, gone in 3.14.
-    return list(await asyncio.gather(*coros))
+    # Each member keeps one context across call and teardown, so contextvars a fixture set
+    # before its yield (e.g. a context manager's token) are still current at teardown.
+    loop = asyncio.get_running_loop()
+    if sys.version_info >= (3, 11):
+        tasks = [loop.create_task(c, context=ctx) for c, ctx in zip(coros, contexts)]
+    else:
+        tasks = [ctx.run(loop.create_task, c) for c, ctx in zip(coros, contexts)]
+    return list(await asyncio.gather(*tasks))
 
 
-async def _call_runtest_async(item: AsyncioConcurrentGroupMember) -> pytest.CallInfo:
+async def _call_runtest_async(
+    item: AsyncioConcurrentGroupMember, setup_call: Optional[pytest.CallInfo]
+) -> "tuple[Optional[pytest.CallInfo], Optional[pytest.CallInfo]]":
+    """Resolve the item's deferred fixtures (when it has any), then run its body."""
     mark = _get_asyncio_concurrent_mark(item)
     assert mark
     timeout = mark.kwargs.get("timeout")
 
-    return await _async_callinfo_from_call(
+    if setup_call is not None:
+        resolved = await _async_callinfo_from_call(
+            functools.partial(fixture_async.resolve_deferred, item), timeout=None, when="setup"
+        )
+        setup_call = pytest.CallInfo(
+            start=setup_call.start,
+            stop=resolved.stop,
+            duration=setup_call.duration + resolved.duration,
+            when="setup",
+            result=None,
+            excinfo=resolved.excinfo,
+            _ispytest=True,
+        )
+        if resolved.excinfo is not None:
+            return setup_call, None
+
+    return setup_call, await _async_callinfo_from_call(
         functools.partial(item.ihook.pytest_runtest_call_async, item=item),  # type: ignore
         timeout=timeout,
     )
@@ -296,9 +355,10 @@ def _setup_child(item: AsyncioConcurrentGroupMember) -> Callable[[], None]:
         if not item.group.has_setup:
             item.ihook.pytest_runtest_setup_async_group(item=item.group)
 
-        item.config.pluginmanager.subset_hook_caller(
-            "pytest_runtest_setup", [item.config.pluginmanager.get_plugin("runner")]
-        )(item=item)
+        with fixture_async.deferring():
+            item.config.pluginmanager.subset_hook_caller(
+                "pytest_runtest_setup", [item.config.pluginmanager.get_plugin("runner")]
+            )(item=item)
 
     return inner
 
@@ -460,7 +520,9 @@ def _get_group_strategy(config: pytest.Config) -> GroupStrategy:
 
 # referencing CallInfo.from_call
 async def _async_callinfo_from_call(
-    func: Callable[[], Coroutine], timeout: Optional[int]
+    func: Callable[[], Coroutine],
+    timeout: Optional[int],
+    when: Literal["setup", "call"] = "call",
 ) -> pytest.CallInfo:
     """An async version of CallInfo.from_call"""
 
@@ -483,7 +545,7 @@ async def _async_callinfo_from_call(
         start=start,
         stop=stop,
         duration=duration,
-        when="call",
+        when=when,
         result=result,
         excinfo=excinfo,
         _ispytest=True,
@@ -493,16 +555,19 @@ async def _async_callinfo_from_call(
 
 
 # referencing runner.call_and_report
-def _call_and_report(
+def _call(
     func: Callable[[], None],
     item: pytest.Item,
     when: Literal["setup", "teardown"],
-) -> pytest.TestReport:
+) -> pytest.CallInfo:
     reraise: tuple[type[BaseException], ...] = (outcomes.Exit,)
     if not item.config.getoption("usepdb", False):
         reraise += (KeyboardInterrupt,)
 
-    call = pytest.CallInfo.from_call(func, when=when, reraise=reraise)
+    return pytest.CallInfo.from_call(func, when=when, reraise=reraise)
+
+
+def _report(call: pytest.CallInfo, item: pytest.Item) -> pytest.TestReport:
     report: pytest.TestReport = item.ihook.pytest_runtest_makereport(item=item, call=call)
     item.ihook.pytest_runtest_logreport(report=report)
 
